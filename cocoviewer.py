@@ -7,6 +7,7 @@ import argparse
 import colorsys
 import json
 import logging
+import math
 import os
 import random
 import tkinter as tk
@@ -108,13 +109,21 @@ def get_images(instances: dict) -> list:
     return [(image["id"], image["file_name"]) for image in instances["images"]]
 
 
-def open_image(full_img_path: str):
+def open_image(full_img_path: str, zoom_ratio: float = None):
     """Opens image, creates draw context."""
     # Open image
     img_open = Image.open(full_img_path).convert("RGBA")
+
+    # resize image if zoom_ratio is given
+    if zoom_ratio is not None: 
+        cur_w, cur_h = img_open.size
+        new_w, new_h = int(cur_w * zoom_ratio), int(cur_h * zoom_ratio)
+        img_open = img_open.resize((new_w, new_h), Image.BICUBIC)
+
     # Create layer for bboxes and masks
     draw_layer = Image.new("RGBA", img_open.size, (255, 255, 255, 0))
     draw = ImageDraw.Draw(draw_layer)
+
     return img_open, draw_layer, draw
 
 
@@ -148,18 +157,29 @@ def get_categories(instances: dict) -> dict:
     return categories
 
 
-def draw_bboxes(draw, objects, labels, obj_categories, ignore, width, label_size):
+def draw_bboxes(draw, objects, labels, obj_categories, ignore, width, label_size, zoom_ratio = None):
     """Puts rectangles on the image."""
     # Extracting bbox coordinates
-    bboxes = [
-        [
-            obj["bbox"][0],
-            obj["bbox"][1],
-            obj["bbox"][0] + obj["bbox"][2],
-            obj["bbox"][1] + obj["bbox"][3],
+    if zoom_ratio is not None:
+        bboxes = [
+            [
+                obj["bbox"][0] * zoom_ratio,
+                obj["bbox"][1] * zoom_ratio,
+                (obj["bbox"][0] + obj["bbox"][2]) * zoom_ratio,
+                (obj["bbox"][1] + obj["bbox"][3]) * zoom_ratio,
+            ]
+            for obj in objects
         ]
-        for obj in objects
-    ]
+    else:
+        bboxes = [
+            [
+                obj["bbox"][0],
+                obj["bbox"][1],
+                obj["bbox"][0] + obj["bbox"][2],
+                obj["bbox"][1] + obj["bbox"][3],
+            ]
+            for obj in objects
+        ]
     # Draw bboxes
     for i, (c, b) in enumerate(zip(obj_categories, bboxes)):
         if i not in ignore:
@@ -200,7 +220,7 @@ def draw_bboxes(draw, objects, labels, obj_categories, ignore, width, label_size
                 draw.text((tx0, ty0), text, (255, 255, 255), font=font)
 
 
-def draw_masks(draw, objects, obj_categories, ignore, alpha):
+def draw_masks(draw, objects, obj_categories, ignore, alpha, zoom_ratio = None):
     """Draws a masks over image."""
     masks = [obj["segmentation"] for obj in objects]
     # Draw masks
@@ -212,11 +232,17 @@ def draw_masks(draw, objects, obj_categories, ignore, alpha):
             if isinstance(m, list):
                 for m_ in m:
                     if m_:
+                        if zoom_ratio is not None:
+                            m_ = [x * zoom_ratio for x in m_]
                         draw.polygon(m_, outline=fill, fill=fill)
             # RLE mask for collection of objects (iscrowd=1)
             elif isinstance(m, dict) and objects[i]["iscrowd"]:
                 mask = rle_to_mask(m["counts"][:-1], m["size"][0], m["size"][1])
                 mask = Image.fromarray(mask)
+                if zoom_ratio is not None:
+                    cur_w, cur_h = draw.im.size
+                    new_w, new_h = int(cur_w * zoom_ratio), int(cur_h * zoom_ratio)
+                    mask = mask.resize((new_w, new_h))
                 draw.bitmap((0, 0), mask, fill=fill)
 
             else:
@@ -505,6 +531,10 @@ class SlidersBar(ttk.Frame):
         self.mask_slider = tk.Scale(self, label="mask", from_=0, to=255, tickinterval=50, orient=tk.HORIZONTAL)
         self.mask_slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
+        # Zoom level controller
+        self.zoom_level = tk.Scale(self, label="zoom level", from_=-4.0, to=4.0, tickinterval=10, orient=tk.HORIZONTAL, resolution=0.1)
+        self.zoom_level.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
 
 class Controller:
     def __init__(self, data, root, image_panel, statusbar, menu, objects_panel, sliders):
@@ -574,9 +604,12 @@ class Controller:
         self.label_size.set(15)
         self.mask_alpha = tk.IntVar()
         self.mask_alpha.set(128)
+        self.zoom_level = tk.IntVar()
+        self.zoom_level.set(0)
         self.sliders.bbox_slider.configure(variable=self.bbox_thickness, command=lambda e: self.update_img())
         self.sliders.label_slider.configure(variable=self.label_size, command=lambda e: self.update_img())
         self.sliders.mask_slider.configure(variable=self.mask_alpha, command=lambda e: self.update_img())
+        self.sliders.zoom_level.configure(variable=self.zoom_level, command=lambda e: self.update_img())
 
         # Bind all events
         self.bind_events()
@@ -608,20 +641,21 @@ class Controller:
         width: int = 1,
         alpha: int = 128,
         label_size: int = 15,
+        zoom_ratio: float = None,
     ):
         ignore = ignore or []  # list of objects to ignore
-        img_open, draw_layer, draw = open_image(full_path)
+        img_open, draw_layer, draw = open_image(full_path, zoom_ratio)
         # Draw masks
         if masks_on:
-            draw_masks(draw, objects, names_colors, ignore, alpha)
+            draw_masks(draw, objects, names_colors, ignore, alpha, zoom_ratio)
         # Draw bounding boxes
         if bboxes_on:
-            draw_bboxes(draw, objects, labels_on, names_colors, ignore, width, label_size)
+            draw_bboxes(draw, objects, labels_on, names_colors, ignore, width, label_size, zoom_ratio)
         del draw
         # Resulting image
         self.current_composed_image = Image.alpha_composite(img_open, draw_layer)
 
-    def update_img(self, local=True, width=None, alpha=None, label_size=None):
+    def update_img(self, local=True, width=None, alpha=None, label_size=None, zoom_level=None):
         """Triggers image composition and sets composed image as current."""
         bboxes_on = self.bboxes_on_local if local else self.bboxes_on_global.get()
         labels_on = self.labels_on_local if local else self.labels_on_global.get()
@@ -647,6 +681,8 @@ class Controller:
         width = self.bbox_thickness.get() if width is None else width
         alpha = self.mask_alpha.get() if alpha is None else alpha
         label_size = self.label_size.get() if label_size is None else label_size
+        zoom_level = self.zoom_level.get() if zoom_level is None else zoom_level
+        zoom_ratio = math.pow(2.0, zoom_level)
 
         # Compose image
         self.compose_image(
@@ -660,6 +696,7 @@ class Controller:
             width=width,
             alpha=alpha,
             label_size=label_size,
+            zoom_ratio=zoom_ratio,
         )
 
         # Prepare PIL image for Tkinter
@@ -896,3 +933,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
